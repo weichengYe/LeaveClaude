@@ -7,14 +7,14 @@ from pydantic import BaseModel, Field
 
 class JsonRpcRequest(BaseModel):
     jsonrpc: Literal["2.0"] = "2.0"
-    id: str
+    id: str | int
     method: str
     params: dict[str, Any] = Field(default_factory=dict)
 
 
 class JsonRpcSuccess(BaseModel):
     jsonrpc: Literal["2.0"] = "2.0"
-    id: str
+    id: str | int
     result: Any
 
 
@@ -26,7 +26,7 @@ class JsonRpcErrorObject(BaseModel):
 
 class JsonRpcError(BaseModel):
     jsonrpc: Literal["2.0"] = "2.0"
-    id: str | None = None
+    id: str | int | None = None
     error: JsonRpcErrorObject
 
 
@@ -38,5 +38,5 @@ INTERNAL_ERROR = -32603   # 服务器内部错误
 
 
 # 构造一个 JSON-RPC 错误响应对象
-def make_error(id: str | None, code: int, message: str, data: Any = None) -> JsonRpcError:
+def make_error(id: str | int | None, code: int, message: str, data: Any = None) -> JsonRpcError:
     return JsonRpcError(id=id, error=JsonRpcErrorObject(code=code, message=message, data=data))

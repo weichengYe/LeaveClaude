@@ -36,23 +36,35 @@ class SocketServer:
     def register(self, method: str, handler: CommandHandler) -> None:
         self._handlers[method] = handler
 
-    # 启动 TCP 服务器；若端口已被占用则退出进程
+    # 启动 TCP 服务器；bind 失败时再探测端口以区分"已有 core"还是"其他占用"
     async def start(self) -> str:
+        try:
+            self._server = await asyncio.start_server(
+                self._handle_connection,
+                host=self._host,
+                port=self._port,
+                limit=_MAX_LINE_BYTES,
+            )
+        except OSError as exc:
+            probe_ok = await self._probe()
+            if probe_ok:
+                raise SystemExit(
+                    f"core already running at {self._host}:{self._port}"
+                ) from exc
+            raise SystemExit(
+                f"cannot bind {self._host}:{self._port}: {exc}"
+            ) from exc
+        return f"{self._host}:{self._port}"
+
+    # 探测端口是否有可连接的服务,用于区分端口占用原因
+    async def _probe(self) -> bool:
         try:
             _r, w = await asyncio.open_connection(self._host, self._port)
             w.close()
             await w.wait_closed()
-            raise SystemExit(f"core already running at {self._host}:{self._port}")
-        except (ConnectionRefusedError, OSError):
-            pass
-
-        self._server = await asyncio.start_server(
-            self._handle_connection,
-            host=self._host,
-            port=self._port,
-            limit=_MAX_LINE_BYTES,
-        )
-        return f"{self._host}:{self._port}"
+        except OSError:
+            return False
+        return True
 
     # 关闭服务器，最多等待 2 秒
     async def stop(self) -> None:
