@@ -46,7 +46,7 @@ def test_missing_env_file_silent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 
 # .env 中设置的 LEAVE_CONFIG 能影响 TOML 文件加载路径
-def test_dotenv_before_toml_kama_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dotenv_before_toml_leave_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     toml_path = tmp_path / "custom.toml"
     toml_path.write_bytes(b'[core]\nport = 5555\n')
 
