@@ -4,7 +4,7 @@
 已审查,**待实施**(计划在学完 S7 后统一修改,届时对照本 ADR 执行)
 
 ## 背景
-S2 同步完成后,对 `core/transport/`、`tui/app.py`、`cli/commands/core.py`、`core/app.py` 做了逐行 review,共发现 10 处可改进点。其中 8 处确认 KamaClaude 直到 S7 分支也未修复(逐条对照过 S7 源码)。本 ADR 记录**优先修的 3 个**,每个都包含:现状、修法、测试设计——作为后续实施的唯一依据。
+S2 同步完成后,对 `core/transport/`、`tui/app.py`、`cli/commands/core.py`、`core/app.py` 做了逐行 review,共发现 10 处可改进点(2026-09-23 复审追加第 11 处,见改动 1)。其中 8 处确认 KamaClaude 直到 S7 分支也未修复(逐条对照过 S7 源码)。本 ADR 记录**优先修的 3 个**,每个都包含:现状、修法、测试设计——作为后续实施的唯一依据。
 
 **为什么现在不改**:每次从 KamaClaude 同步新阶段都会整树覆盖,现在改会被 S3–S7 的同步反复冲掉。等 S7 学完(最后一次同步),再按本 ADR 一次性修改并补测试,之后不再有同步冲突。
 
@@ -12,7 +12,7 @@ S2 同步完成后,对 `core/transport/`、`tui/app.py`、`cli/commands/core.py`
 
 ---
 
-## 改动 1: Broadcaster drain timeout(慢客户端隔离)
+## 改动 1: Broadcaster drain timeout + 按连接去重(慢客户端隔离)
 
 ### 现状
 `core/transport/ipc_broadcaster.py` 的 `handle()`:
@@ -26,9 +26,16 @@ for sub in list(self._subscriptions):
 
 一个慢订阅者(TUI 挂起/网络卡)会让 `drain()` 无限等待,**阻塞整条事件链路**:Broadcaster → EventBus → AgentLoop。S7 的代码同样如此,且循环里还加了 trace emit,慢客户端的代价更大。
 
+复审追加发现的两个结构性问题:
+
+**(a) 同一连接重复推送(正确性 bug)**。数据模型是扁平的 `list[_Subscription]`,每个订阅独立持有 writer。同一客户端建立多个 topic 重叠的订阅(如 `sub1: ["tool.*"]` + `sub2: ["*"]`)时,一个 `tool.call_started` 事件会**命中两个订阅、向同一 writer 写两次**——客户端收到重复事件。
+
+**(b) 隔离边界错位**。决定发送速度/backpressure 的是 TCP 连接(writer),而 subscription 只是过滤规则。扁平订阅列表把两者混为一谈:同一连接下的多个订阅天然共享网络状况,一个连接慢,它名下所有订阅都慢;更要紧的是,当前实现逐订阅串行 `drain()`,任何连接慢都会拖住其他连接和上游 AgentLoop。
+
 ### 修法(两处合一)
-1. **drain 加 1 秒超时**,超时视为慢连接,踢出订阅列表
+1. **drain 加 1 秒超时**,超时视为慢连接,踢出该连接的全部订阅
 2. **payload 序列化移出循环**:同一事件广播给 N 个订阅者,`model_dump_json()` 只需一次
+3. **按连接去重**:单次 handle 调用内,同一 writer 只写一次(任一订阅命中即算命中)
 
 ```python
 _DRAIN_TIMEOUT_S = 1.0
@@ -41,7 +48,10 @@ async def handle(self, event: BaseModel) -> None:
     payload = EventPushEnvelope(event=event_dict).model_dump_json().encode() + b"\n"
 
     dead: list[asyncio.StreamWriter] = []
+    seen: list[asyncio.StreamWriter] = []
     for sub in list(self._subscriptions):
+        if sub.writer in seen:
+            continue
         if not self._matches_topic(event_type, sub.topics):
             continue
         if not self._matches_scope(run_id, sub.scope):
@@ -49,17 +59,36 @@ async def handle(self, event: BaseModel) -> None:
         try:
             sub.writer.write(payload)
             await asyncio.wait_for(sub.writer.drain(), timeout=_DRAIN_TIMEOUT_S)
+            seen.append(sub.writer)
         except (TimeoutError, ConnectionResetError, BrokenPipeError, OSError):
             logger.warning("dropping slow/dead subscriber %s", sub.sub_id)
             dead.append(sub.writer)
 
     for writer in dead:
-        self.unsubscribe(writer)
+        self.unsubscribe(writer)   # 移除该 writer 名下全部订阅
         writer.close()
 ```
 
-### 为什么不上 per-subscriber Queue
-正确长期方案是 bounded queue + 独立 sender task,但要同时设计:maxsize、队列满策略(丢 token?丢重要事件?)、sender task 生命周期、disconnect 时 cancel。这是 S3+ 的协议级演进,不属于本 ADR。
+### 目标架构(明确为 per-connection,而非 per-subscription)
+
+长期正确方案是**按连接建立 outbound queue + sender task**,而不是按订阅:
+
+```
+Broadcaster(topic/scope 路由)
+   ├── Connection A: writer_A, queue_A, sender_A, [sub: tool.*]
+   ├── Connection B: writer_B, queue_B, sender_B, [sub: *, sub: run.*]
+   └── Connection C: writer_C, queue_C, sender_C, [sub: *]
+```
+
+`handle()` 退化为 O(匹配连接数) 次非阻塞 `queue.put_nowait()`,TCP 写入由各连接的 sender task 独立承担——慢连接只堵自己的队列,不碰别人。这同时自然解决重复推送(按连接入队一次)。
+
+Queue 化必须同时回答的问题(实施时逐项决策):
+- **maxsize 与队满策略**:`llm.token` / debug log 属可丢的高频事件,`run.finished` / `tool.call_failed` 属必须保留的关键事件——需要分级丢弃(QoS),而不是无界队列吃光内存或一律丢头
+- **sender task 生命周期**:连接断开时 cancel,避免任务泄漏
+- **drain timeout 是否保留**:queue 化后 sender 内部仍需写超时,作为 final backstop
+
+### 为什么 S2 仍先用 timeout 过渡
+S2 的真实部署形态是单用户(1 CLI + 1 TUI,连接数 ≤ 2),drain timeout 已把"最坏拖 1 秒"封顶;而 queue 化引入任务生命周期与 QoS 两块新设计面,放在 S3 协议演进里与事件 `seq` 游标(见附录 Replay→Live 一条)一起做更合理。
 
 ### 测试设计(`tests/unit/test_ipc_broadcaster.py` 新增)
 
@@ -77,7 +106,13 @@ async def handle(self, event: BaseModel) -> None:
 - 方式:monkeypatch `EventPushEnvelope.model_dump_json` 计数
 - 断言:2 个订阅者匹配同一事件时,序列化次数 == 1(而非 2)
 
-### T1.4(集成级,可选)
+**T1.4 同一连接 topic 重叠订阅不重复推送**
+- 布局:同一 writer 注册两个订阅(`["tool.*"]` 与 `["*"]`),再注册另一连接的正常订阅
+- 步骤:派发一个 `tool.call_started`
+- 断言:重叠连接的 writer 只收到 **1 次**;另一连接正常收到 1 次
+- 现状(未修)此测试失败(收到 2 次)——正确性 bug 的失败测试先行
+
+### T1.5(集成级,可选)
 真实 TCP 场景:订阅者读端不读数据、SO_RCVBUF 塞满,验证 1s 内 handle 返回。沙箱跑不了 raw socket,归入本地/CI 执行清单。
 
 ---
@@ -237,7 +272,7 @@ await server.stop()
 ## 实施清单(学完 S7 后执行)
 
 ```
-[ ] T1.1–T1.3 失败测试先行 → 改 handle() → 测试转绿
+[ ] T1.1–T1.4 失败测试先行 → 改 handle()(drain timeout + 序列化外提 + 按连接去重)→ 测试转绿
 [ ] T2.1–T2.4 失败测试先行 → 改 send_command()/_dispatch() → 测试转绿
 [ ] T3.1–T3.4 失败测试先行 → 改 _agent_run_handler()/run() → 测试转绿
 [ ] 回归:ruff + mypy strict + pytest 全量
@@ -251,7 +286,7 @@ await server.stop()
 | 问题 | 不修理由 |
 |---|---|
 | TUI `_handle_event` elif 链(15 个分支) | 不引发挂死/泄漏;等事件类型爆炸(S5+ 权限/审批事件)再拆 handler registry |
-| broadcaster `unsubscribe` O(n) | 客户端个位数,量级无感;改 queue 时顺手换 dict |
+| broadcaster `unsubscribe` O(n) | 客户端个位数,量级无感;queue 化(按 Connection 重建数据模型)时一并解决——`unsubscribe`/去重/队列管理统一到 Connection 层 |
 | `Popen stderr=DEVNULL` 吞启动错误 | 影响的是排障体验,不影响正确性;可加 `--foreground` 调试模式替代 |
 | PID 复用误判(`kill(pid,0)` 无 cmdline 校验) | 概率极低;修法(`cat /proc/<pid>/cmdline` 校验)平台相关,不值得引入 |
 | TUI 重连固定 2s 无退避 | 单用户 TUI,刷屏问题大于功能问题 |
