@@ -12,9 +12,19 @@ S2 同步完成后,对 `core/transport/`、`tui/app.py`、`cli/commands/core.py`
 
 ---
 
-## 改动 1: Broadcaster drain timeout + 按连接去重(慢客户端隔离)
+## 改动 1: Broadcaster drain timeout + 按连接去重(本地形态下收敛)
 
-### 现状
+### 范围限定(本次复审的修正)
+LeaveClaude 当前是**本地 coding agent 框架**:Core daemon 监听 `127.0.0.1`(见 `core/config.py:11` 的 `_DEFAULT_HOST = "127.0.0.1"` 与 `RUNBOOK.md:58` 的 `LEAVE_HOST` 默认值),客户端是单用户机器上的 CLI 与 TUI。典型连接数 ≤ 2(1 CLI + 1 TUI),不存在"一个 server 服务多个相互独立的客户端"的场景。
+
+这一架构事实把原 ADR 中部分设计面的紧迫性降下来了:
+
+- **(b) 隔离边界错位 + per-connection queue/sender task 长期方案**:这是面向"多客户端互不拖累"的方案,本地形态下没有触发动机——同一时刻最多一个 CLI + 一个 TUI,且 TUI 慢就让 TUI 自己掉线重连即可,不存在"别人被拖累"的受害者。**本 ADR 不实施 queue 化,标记为 deferred**,仅在 LeaveClaude 演进为 cloud agent(单个 server 后端服务多个独立 agent session / 多用户)时再启动。届时本 ADR 第 "目标架构(已 deferred)" 一节是入口。
+- **(a) 同一连接重复推送**:仍是正确性 bug,与客户端数量无关,**必修**——本地形态下一个 TUI 也可能建立多个 topic 重叠的订阅(冷启动续订 + 全量订阅同时存在等场景),事件被重复推送会让 TUI 重复渲染。
+- **drain 无超时**:仍是健壮性问题,本地形态下也会触发(TUI 挂起/内核缓冲满),**必做**。
+- **payload 序列化移出循环**:零成本优化,与客户端数量无关,**必做**。
+
+### 现状(本地形态下重述)
 `core/transport/ipc_broadcaster.py` 的 `handle()`:
 
 ```python
@@ -24,18 +34,15 @@ for sub in list(self._subscriptions):
     await sub.writer.drain()   # ← 无超时
 ```
 
-一个慢订阅者(TUI 挂起/网络卡)会让 `drain()` 无限等待,**阻塞整条事件链路**:Broadcaster → EventBus → AgentLoop。S7 的代码同样如此,且循环里还加了 trace emit,慢客户端的代价更大。
+两个问题:
 
-复审追加发现的两个结构性问题:
+1. **drain 无限等**:`asyncio.StreamWriter.drain()` 在 TCP send buffer 满时会让出直到对端读取。本地形态下若 TUI 的读循环卡住(渲染 hung、终端焦点切走、pdb 断点等),`drain()` 长时间不返回,AgentLoop 通过 EventBus → Broadcaster 的整条链路被堵。
+2. **同连接重复推送**:扁平 `list[_Subscription]` 让多个 topic 重叠的订阅各自调用 `writer.write()`——同一 writer 在一次 `handle()` 内被写多次,客户端收到重复事件。
 
-**(a) 同一连接重复推送(正确性 bug)**。数据模型是扁平的 `list[_Subscription]`,每个订阅独立持有 writer。同一客户端建立多个 topic 重叠的订阅(如 `sub1: ["tool.*"]` + `sub2: ["*"]`)时,一个 `tool.call_started` 事件会**命中两个订阅、向同一 writer 写两次**——客户端收到重复事件。
-
-**(b) 隔离边界错位**。决定发送速度/backpressure 的是 TCP 连接(writer),而 subscription 只是过滤规则。扁平订阅列表把两者混为一谈:同一连接下的多个订阅天然共享网络状况,一个连接慢,它名下所有订阅都慢;更要紧的是,当前实现逐订阅串行 `drain()`,任何连接慢都会拖住其他连接和上游 AgentLoop。
-
-### 修法(两处合一)
-1. **drain 加 1 秒超时**,超时视为慢连接,踢出该连接的全部订阅
-2. **payload 序列化移出循环**:同一事件广播给 N 个订阅者,`model_dump_json()` 只需一次
-3. **按连接去重**:单次 handle 调用内,同一 writer 只写一次(任一订阅命中即算命中)
+### 修法(三处合一,但范围限定为本地形态)
+1. **drain 加 1 秒超时**,超时视为慢/死连接,踢出该 writer 名下的全部订阅并 `close()`——这一动作同时兼任"对端已断开"的清理路径(本地 TUI 异常退出后 socket 半开,丢数据会触发 BrokenPipe)。
+2. **payload 序列化移出循环**:同一事件广播给多个订阅者,`model_dump_json()` 只需一次。
+3. **按连接去重**(单次 `handle()` 内):同一 writer 只写一次,任一订阅命中即算命中——修 (a) 的正确性 bug。
 
 ```python
 _DRAIN_TIMEOUT_S = 1.0
@@ -69,9 +76,10 @@ async def handle(self, event: BaseModel) -> None:
         writer.close()
 ```
 
-### 目标架构(明确为 per-connection,而非 per-subscription)
+说明:`dead` 列表在本地形态下基本只命中 `TimeoutError`(对端读循环卡住)与 `BrokenPipeError`(对端进程已退);`unsubscribe(writer)` 顺手清掉该 writer 残留的旧订阅条目,免得重连后重复计数。
 
-长期正确方案是**按连接建立 outbound queue + sender task**,而不是按订阅:
+### 目标架构(已 deferred,仅 cloud agent 时启动)
+长期正确方案是**按连接建立 outbound queue + sender task**——但**这不在本 ADR 的实施范围**。
 
 ```
 Broadcaster(topic/scope 路由)
@@ -80,40 +88,39 @@ Broadcaster(topic/scope 路由)
    └── Connection C: writer_C, queue_C, sender_C, [sub: *]
 ```
 
-`handle()` 退化为 O(匹配连接数) 次非阻塞 `queue.put_nowait()`,TCP 写入由各连接的 sender task 独立承担——慢连接只堵自己的队列,不碰别人。这同时自然解决重复推送(按连接入队一次)。
+触发条件(任一即可启动 queue 化):
+- LeaveClaude 引入 **cloud agent 模式**:单个 server 后端服务多个用户 / 多个独立 agent session,需要"一个客户端慢不能拖累其他客户端"
+- 事件频率显著上升(例如加入 `llm.token` 流式事件、debug log 推送),逐订阅同步 `drain()` 在本地也开始卡顿
+- 多播 / pub-sub 外部消费者接入(例如 metrics collector、审计服务)
 
-Queue 化必须同时回答的问题(实施时逐项决策):
-- **maxsize 与队满策略**:`llm.token` / debug log 属可丢的高频事件,`run.finished` / `tool.call_failed` 属必须保留的关键事件——需要分级丢弃(QoS),而不是无界队列吃光内存或一律丢头
+届时需要同时回答的设计问题(预先列出,实施时逐项决策):
+- **maxsize 与队满策略(QoS)**:`llm.token` / debug log 属可丢的高频事件,`run.finished` / `tool.call_failed` 属必须保留的关键事件——需要分级丢弃,而不是无界队列吃光内存或一律丢头
 - **sender task 生命周期**:连接断开时 cancel,避免任务泄漏
-- **drain timeout 是否保留**:queue 化后 sender 内部仍需写超时,作为 final backstop
-
-### 为什么 S2 仍先用 timeout 过渡
-S2 的真实部署形态是单用户(1 CLI + 1 TUI,连接数 ≤ 2),drain timeout 已把"最坏拖 1 秒"封顶;而 queue 化引入任务生命周期与 QoS 两块新设计面,放在 S3 协议演进里与事件 `seq` 游标(见附录 Replay→Live 一条)一起做更合理。
+- **drain timeout 保留**:queue 化后 sender 内部仍需写超时,作为 final backstop
+- **数据模型迁移**:扁平 `list[_Subscription]` → `dict[StreamWriter, Connection]`,`unsubscribe`/去重/队列管理统一到 Connection 层(同步解掉附录中 "broadcaster `unsubscribe` O(n)" 一项)
 
 ### 测试设计(`tests/unit/test_ipc_broadcaster.py` 新增)
 
-**T1.1 慢订阅者不阻塞其他订阅者**
-- 布局:两个订阅者,A 的 `writer.drain` mock 成永不返回(如 `asyncio.Event().wait()`);B 正常
+**T1.1 慢订阅者不阻塞 handle**(本地形态下的关键不变量)
+- 布局:单个订阅者,`writer.drain` mock 成永不返回(如 `asyncio.Event().wait()`)
 - 步骤:`handle(event)` 用 `asyncio.wait_for(..., timeout=3)` 包裹
-- 断言:整体在 3s 内完成;B **收到了** payload;A 被加入 dead 并 unsubscribe
-- 现状(未修)此测试必然超时失败——这就是"失败测试先行"
+- 断言:整体在 ~1s 内完成;该订阅者被加入 dead 并 `unsubscribe`;`writer.close()` 被调用
 
 **T1.2 慢订阅者被清理后不再收事件**
-- 布局:T1.1 触发一次 handle 后,继续 `handle` 第二个事件
-- 断言:A 的 writer 不再被写入;订阅列表长度恢复
+- 布局:T1.1 触发一次 `handle` 后,继续 `handle` 第二个事件
+- 断言:原订阅者 writer 不再被写入;订阅列表恢复
 
 **T1.3 payload 只序列化一次**
 - 方式:monkeypatch `EventPushEnvelope.model_dump_json` 计数
-- 断言:2 个订阅者匹配同一事件时,序列化次数 == 1(而非 2)
+- 断言:多个订阅者匹配同一事件时,序列化次数 == 1(而非 N)
 
-**T1.4 同一连接 topic 重叠订阅不重复推送**
-- 布局:同一 writer 注册两个订阅(`["tool.*"]` 与 `["*"]`),再注册另一连接的正常订阅
+**T1.4 同一连接 topic 重叠订阅不重复推送**(正确性 bug 的失败测试先行)
+- 布局:同一 writer 注册两个订阅(`["tool.*"]` 与 `["*"]`)
 - 步骤:派发一个 `tool.call_started`
-- 断言:重叠连接的 writer 只收到 **1 次**;另一连接正常收到 1 次
-- 现状(未修)此测试失败(收到 2 次)——正确性 bug 的失败测试先行
+- 断言:该 writer 只收到 **1 次**;`writer.write` 调用次数 == 1
+- 现状(未修)此测试必然失败——这就是"失败测试先行"
 
-### T1.5(集成级,可选)
-真实 TCP 场景:订阅者读端不读数据、SO_RCVBUF 塞满,验证 1s 内 handle 返回。沙箱跑不了 raw socket,归入本地/CI 执行清单。
+**T1.5(可选,本地形态下收益小)** 真实 TCP 半开连接:订阅者读端不读数据、SO_RCVBUF 塞满,验证 ~1s 内 `handle` 返回。沙箱跑不了 raw socket,归入本地/CI 执行清单。**注:此条在本地形态下重要性大幅下降,因为只有 TUI 自己慢这一种触发路径;真正需要它的是 cloud agent 形态下的多客户端互扰。**
 
 ---
 
@@ -272,7 +279,7 @@ await server.stop()
 ## 实施清单(学完 S7 后执行)
 
 ```
-[ ] T1.1–T1.4 失败测试先行 → 改 handle()(drain timeout + 序列化外提 + 按连接去重)→ 测试转绿
+[ ] T1.1–T1.4 失败测试先行 → 改 handle()(drain timeout + 序列化外提 + 按连接去重)→ 测试转绿;T1.5 本地形态下收益小,可选
 [ ] T2.1–T2.4 失败测试先行 → 改 send_command()/_dispatch() → 测试转绿
 [ ] T3.1–T3.4 失败测试先行 → 改 _agent_run_handler()/run() → 测试转绿
 [ ] 回归:ruff + mypy strict + pytest 全量
@@ -286,9 +293,9 @@ await server.stop()
 | 问题 | 不修理由 |
 |---|---|
 | TUI `_handle_event` elif 链(15 个分支) | 不引发挂死/泄漏;等事件类型爆炸(S5+ 权限/审批事件)再拆 handler registry |
-| broadcaster `unsubscribe` O(n) | 客户端个位数,量级无感;queue 化(按 Connection 重建数据模型)时一并解决——`unsubscribe`/去重/队列管理统一到 Connection 层 |
+| broadcaster `unsubscribe` O(n) | 客户端个位数,量级无感;本 ADR 不做 queue 化,此 O(n) 在本地形态下不构成问题;若未来演进出 cloud agent 触发 queue 化,数据模型迁移到 per-Connection 时一并解决(详见改动 1 "目标架构(已 deferred)" 一节) |
 | `Popen stderr=DEVNULL` 吞启动错误 | 影响的是排障体验,不影响正确性;可加 `--foreground` 调试模式替代 |
 | PID 复用误判(`kill(pid,0)` 无 cmdline 校验) | 概率极低;修法(`cat /proc/<pid>/cmdline` 校验)平台相关,不值得引入 |
 | TUI 重连固定 2s 无退避 | 单用户 TUI,刷屏问题大于功能问题 |
-| `run_event_loop` 无优雅停止 | cancel task 目前够用;与 queue 化改造(S3)一起做 |
+| `run_event_loop` 无优雅停止 | cancel task 目前够用;queue 化不在本 ADR 实施范围内(改动 1 已标 deferred),此条留待真正需要时再启动 |
 | Replay→Live gap(replay 与 subscribe 之间的事件丢失) | 正确解是事件协议加 `seq` 字段 + client 维护 `after_seq` 游标,属 S3 协议演进;S2 先明确 replay 是 best-effort |

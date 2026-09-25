@@ -46,6 +46,8 @@ leave-core (daemon)
 leave (CLI)   leave-tui (TUI, S2+)
 ```
 
+**`leave-tui` is the primary frontend.** All user-facing work on task management, observability, and interaction should be designed for and validated in the TUI first. The `leave` CLI exists only for quick scripted testing and debugging — it is not a product surface. When implementing features that touch the user interface, invest in the TUI layout, event rendering, and keyboard interactions. Do not shortcut TUI work by pointing to the CLI as an alternative.
+
 ### Protocol layer (`src/leave_claude/core/bus/`)
 
 All IPC messages are typed pydantic v2 models with a **discriminated union on the `type` field**. This is the contract boundary — adding a new command or event means adding a new model class to `commands.py` or `events.py` and extending the `Command`/`Event` union.
