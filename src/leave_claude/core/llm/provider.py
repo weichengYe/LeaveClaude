@@ -60,7 +60,7 @@ class AnthropicProvider:
 
         kwargs: dict[str, object] = {
             "model": self._model,
-            "max_tokens": 4096,
+            "max_tokens": 16384,
             "system": system,
             "messages": messages,
         }

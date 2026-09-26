@@ -17,6 +17,16 @@ uv run leave ping
 # → pong server=0.0.1 uptime=12ms latency=2ms
 ```
 
+### 运行一次任务
+
+```bash
+uv run leave run --goal "把 README 里的错别字修好"
+uv run leave run --file ./goal.txt        # 从 UTF-8 文本文件读取 goal
+```
+
+`--goal` 与 `--file` 互斥且必须二选一。文件内容会去除首尾空白；文件不存在、不可读、
+非 UTF-8 或内容为空时，命令会打印 `error: ...` 并以退出码 1 结束。
+
 ### 停止守护进程
 
 ```bash
@@ -93,3 +103,4 @@ tail -f ~/.leave/logs/core.log
 | `core not running` | 未启动守护进程 | `uv run leave-core` |
 | `Address already in use` | 端口被其他进程占用 | `LEAVE_PORT=8000 uv run leave-core` |
 | `Config error: LEAVE_PORT must be an integer` | `.env` 或环境变量中端口值非整数 | 检查 `LEAVE_PORT` 的值 |
+| `error: goal file not found: <path>` | `run --file` 指向的文件不存在/不可读 | 检查路径，或改用 `--goal` |

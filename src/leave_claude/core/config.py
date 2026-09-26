@@ -14,7 +14,7 @@ _DEFAULT_LOG_LEVEL = "INFO"
 _DEFAULT_LOG_FILE = "~/.leave/logs/core.log"
 _DEFAULT_LOG_FORMAT = "text"
 _DEFAULT_CONFIG_PATH = "~/.leave/config.toml"
-_DEFAULT_MAX_STEPS = 40
+_DEFAULT_MAX_STEPS = 100
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_TRACE_FILE = "~/.leave/traces/daemon.jsonl"
 
