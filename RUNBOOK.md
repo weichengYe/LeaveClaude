@@ -103,4 +103,3 @@ tail -f ~/.leave/logs/core.log
 | `core not running` | 未启动守护进程 | `uv run leave-core` |
 | `Address already in use` | 端口被其他进程占用 | `LEAVE_PORT=8000 uv run leave-core` |
 | `Config error: LEAVE_PORT must be an integer` | `.env` 或环境变量中端口值非整数 | 检查 `LEAVE_PORT` 的值 |
-| `error: goal file not found: <path>` | `run --file` 指向的文件不存在/不可读 | 检查路径，或改用 `--goal` |
