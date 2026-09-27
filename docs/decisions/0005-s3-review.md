@@ -1,258 +1,854 @@
-# ADR 0005: S3 阶段的四个跟进改进（任务系统 / DAG 审计 / 测试隔离 / LLM 保险丝）
+# ADR 0005：S3 Task Planning 系统强化——保留任务 DAG、收紧状态约束并让 AgentLoop 感知任务状态
 
-## 状态
-已审查，**待实施**（计划与 ADR 0004 一起，在 S7 学完后统一实施，届时对照本 ADR 执行）
-
-## 背景
-S3 同步完成后，实际跑通了两次真实任务（一次 15 步失败、一次 45 步成功），并做了端到端复盘，包括：
-
-- 读 `runs/<run_id>/events.jsonl` 的完整事件流（342 条事件）
-- 逐个检查 `runs/<run_id>/.tasks/task_*.json` 的落盘状态
-- 追踪 LLM 在 step 11 调 `task_create` 时的 `tool.call_started` params
-- 对比 `git stash` 前后的集成测试结果（隔离 pre-existing 问题）
-
-本 ADR 记录**复盘发现的 4 个真实问题**，均为"当前能跑、S3 阶段不可见、S4+ 会放大"的隐患。不修代码，等 S7 学完后统一改。
+- **Status**: Proposed
+- **Date**: 2026-09-26
+- **Scope**: LeaveClaude / KamaClaude S3 Task Planning，兼容后续 S4–S7 架构
+- **Decision owners**: LeaveClaude
+- **Related stages**: S3, S4, S5, S6, S7
 
 ---
 
-## 问题 1: `TaskManager._clear_dependency()` 会抹平 DAG 审计信息
+## 1. 背景
 
-### 现状
-`src/leave_claude/core/task/manager.py:79-80` 的 `update()` 方法：
+S3 引入了基于工具调用的任务规划机制：
 
-```python
-if status == "completed":
-    self._clear_dependency(task_id)
+```text
+LLM / AgentLoop
+    │
+    ├── task_create
+    ├── task_update
+    ├── task_list
+    └── task_get
+            │
+            ▼
+       TaskManager
+            │
+       .tasks/*.json
 ```
 
-以及 `manager.py:107-120` 的 `_clear_dependency()`：
+该设计保持了 AgentLoop 的 ReAct 结构，不引入独立 Planner / Scheduler，而是让 LLM 自主决定何时创建任务、设置依赖、推进状态。
 
-```python
-# 将 completed_id 从所有其他任务的 blocked_by 列表中移除
-def _clear_dependency(self, completed_id: int) -> None:
-    for f in self._dir.glob("task_*.json"):
-        try:
-            data = json.loads(f.read_text())
-        except (ValueError, json.JSONDecodeError):
-            continue
-        blocked = [int(x) for x in data.get("blocked_by", [])]
-        if completed_id in blocked:
-            data["blocked_by"] = [x for x in blocked if x != completed_id]
-            data["updated_at"] = _now()
-            f.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+真实运行表明，这套机制能够完成较复杂的 Coding Agent 工作。例如一次 `leave run --file` 功能实现中，Agent 建立了：
+
+```text
+#1 Design & review
+        ↓
+#2 Implement argparse --file
+        ↓
+#3 Add tests
+        ↓
+#4 Run verification
 ```
 
-### 实际运行证据
-`runs/20260925-144950-d85a79/`（45 步成功 run）的时序：
+并按照 `pending → in_progress → completed` 推进，最终成功完成任务。
 
-**T0** — LLM 在 step 11 发起 4 个 `task_create`，其中 task 2 传了 `"blocked_by": [1]`（tool.call_started 事件里可见）：
+但是多轮运行也暴露出：当前 Task 系统更接近 **structured planning memory / Todo state**，尚未成为 Agent Harness 的真正执行控制平面。
+
+---
+
+## 2. S4–S7 复查结论
+
+复查 KamaClaude `stage/s4`、`stage/s5`、`stage/s6`、`stage/s7` 后发现：
+
+### 2.1 TaskManager 在 S4–S7 没有继续演进
+
+以下四个分支中的：
+
+```text
+src/kama_claude/core/task/manager.py
+```
+
+使用相同 Git blob SHA：
+
+```text
+8c27a5548dbb0d095b0c19f69f0753cf76899a63
+```
+
+因此 S3 TaskManager 的核心语义一直保留到 S7，包括：
+
+- `blocked_by` 既表示任务依赖，又表示“当前未解除依赖”；
+- completed 后调用 `_clear_dependency()` 删除其他任务中的依赖 ID；
+- `update()` 可任意修改 `pending / in_progress / completed`；
+- 不检查 blocked task 是否可以进入 `in_progress`；
+- 不检测 self dependency / cycle；
+- `_save()` 直接覆盖 JSON 文件；
+- `list_all()` 对部分损坏任务直接跳过。
+
+### 2.2 S7 AgentLoop 仍然不感知 TaskManager
+
+S7 AgentLoop 新增了：
+
+- permission manager；
+- context compaction；
+- session id；
+- thinking block；
+- max_tokens 异常补偿；
+
+但终止逻辑仍是：
+
+```text
+stop_reason == end_turn
+    → success
+
+step >= max_steps
+    → failed(exceeded_max_steps)
+```
+
+AgentLoop 没有 TaskManager 引用，也不会在成功退出前检查 unfinished tasks。
+
+### 2.3 S7 增加 Session，但不是 Task checkpoint/resume
+
+S7 SessionManager 支持：
+
+- session create；
+- thread 持久化；
+- session resume；
+- multi-turn conversation；
+- compaction；
+- note persistence。
+
+但是每个新的 run 仍然创建：
+
+```text
+<run_path>/.tasks/
+```
+
+即 TaskManager 仍然是 **per-run**。
+
+因此：
+
+```text
+session continuation ≠ task graph continuation
+```
+
+若某一 run 因 `max_steps` 失败，下一次 session message 可以继续上下文，但不会自动恢复上一 run 的 Task DAG、当前 task 或 dependency state。
+
+### 2.4 S7 增加 Subagent 并行，但没有接入 Task DAG
+
+S7 已支持：
+
+```text
+spawn_agent(run_in_background=true)
+agent_result(run_id)
+```
+
+因此“没有并行 Agent 能力”这一问题在 S7 已得到解决。
+
+但是：
+
+- parent TaskManager 不会调度 subagent；
+- Task 节点没有 `assigned_run_id / subagent_id`；
+- subagent 自己创建独立 `.tasks`；
+- Task DAG 与 BackgroundTaskRegistry 是两个独立系统。
+
+因此只能认为：
+
+```text
+并行 Subagent 能力：已解决
+Task DAG 自动并行调度：未解决
+```
+
+### 2.5 Task UI 仍不是一等 UI
+
+S7 TUI 仍主要通过：
+
+```text
+tool.call_started
+tool.call_finished
+```
+
+把 `task_create / task_update / task_list` 当作普通 ToolCallBlock 展示。
+
+事件模型中没有：
+
+```text
+task.created
+task.updated
+task.completed
+```
+
+因此仍缺少稳定的 Task Board / DAG 展示接口。
+
+---
+
+## 3. S3 问题到 S7 的状态矩阵
+
+| 问题 | S7 状态 | 说明 |
+|---|---|---|
+| `blocked_by` 完成后被删除，历史 DAG 丢失 | ❌ 未解决 | TaskManager S4–S7 未变化 |
+| blocked task 仍可直接 `in_progress` | ❌ 未解决 | update 无依赖检查 |
+| 状态可任意回退/跳跃 | ❌ 未解决 | 无 transition state machine |
+| 不检测 self dependency / cycle | ❌ 未解决 | 仅 create 时检查依赖文件存在 |
+| AgentLoop 不检查 unfinished tasks | ❌ 未解决 | end_turn 仍直接 success |
+| 复杂任务 planning 可能出现过晚 | ❌ 未解决 | system prompt 仍仅要求完成 goal |
+| max_steps 是硬悬崖 | ❌ 未解决 | 无预算提醒 / graceful checkpoint |
+| max_steps 后自动恢复 Task | ❌ 未解决 | Session 持久化不包含跨 run Task DAG |
+| Task description 无法重规划更新 | ❌ 未解决 | task_update 仅 status / blocked_by |
+| `completed` 无验证证据 | ❌ 未解决 | Task Model 无 acceptance/evidence |
+| Task scope 膨胀后无 child task 结构 | ❌ 未解决 | Task 无 parent_id |
+| Task 专用事件 / TUI Task Board | ❌ 未解决 | 仍通过通用 tool events |
+| Task JSON 原子写入 | ❌ 未解决 | 直接 `Path.write_text()` |
+| 并行 Subagent | ✅ 已解决 | S7 SpawnAgentTool 支持后台并行 |
+| Task DAG 自动并行调度 | ❌ 未解决 | Subagent registry 与 TaskManager 独立 |
+| 多轮会话上下文恢复 | ✅ 已解决 | SessionManager / SessionStore |
+| Task DAG 跨 run 恢复 | ❌ 未解决 | TaskManager 仍位于 run_path/.tasks |
+| Context 长度压力 | ✅/部分 | S7 compaction 可缓解，但与 Task budget 无关 |
+
+---
+
+## 4. 决策
+
+### 4.1 保留 S3 的总体架构
+
+不引入完整 Planner–Executor Workflow Engine。
+
+继续采用：
+
+```text
+ReAct AgentLoop
+    +
+Task Tools
+    +
+TaskManager
+```
+
+原因：
+
+1. 已通过真实 Coding Agent 任务验证可工作；
+2. 结构简单，适合当前 LeaveClaude 阶段；
+3. 后续 S4–S7 的 Session / Permission / Subagent / MCP 等能力均建立在现有 AgentLoop 周围；
+4. 当前主要问题是 Task 状态语义和 Harness 约束不足，而非缺少完整 Scheduler。
+
+---
+
+## 4.2 将“依赖结构”和“运行时阻塞状态”分离
+
+废弃：
+
+```python
+blocked_by: list[int]
+```
+
+作为唯一依赖表示。
+
+改为：
+
+```python
+depends_on: list[int]
+```
+
+永久保存原始 DAG。
+
+运行时动态计算：
+
+```python
+def unresolved_dependencies(task_id: int) -> list[int]:
+    ...
+```
+
+例如：
+
+```text
+Task #2 depends_on=[1]
+
+#1 pending
+→ unresolved=[1]
+
+#1 completed
+→ unresolved=[]
+```
+
+完成 #1 时不再删除 #2 的依赖边。
+
+### 结果
+
+即使所有任务完成后，仍能恢复：
+
+```text
+#1 → #2 → #3 → #4
+```
+
+用于：
+
+- 调试；
+- TUI DAG 展示；
+- Run 复盘；
+- 后续调度；
+- 统计规划质量。
+
+---
+
+## 4.3 TaskManager 增加状态机和依赖校验
+
+最小合法状态流：
+
+```text
+pending
+   │
+   │ unresolved_dependencies == []
+   ▼
+in_progress
+   │
+   ▼
+completed
+```
+
+第一阶段不增加复杂 failure state，但禁止：
+
+```text
+pending → completed
+completed → pending
+completed → in_progress
+blocked pending → in_progress
+```
+
+同时校验：
+
+- dependency task 必须存在；
+- task 不能依赖自身；
+- 新增 dependency 后不得形成环；
+- 依赖列表保持稳定顺序，不使用 `set()` 破坏顺序。
+
+推荐 API：
+
+```python
+TaskManager.start(task_id)
+TaskManager.complete(task_id)
+TaskManager.update_plan(...)
+```
+
+而不是让 Tool 直接任意写 status。
+
+---
+
+## 4.4 AgentLoop 增加 Task Completion Guard
+
+AgentLoop 可以接收可选的 TaskManager：
+
+```python
+AgentLoop(
+    provider,
+    registry,
+    bus,
+    task_manager=task_manager,
+)
+```
+
+当：
+
+```text
+response.stop_reason == "end_turn"
+```
+
+时：
+
+```text
+没有创建过 Task
+    → 正常 success
+
+创建过 Task 且全部 completed
+    → success
+
+创建过 Task 且仍有 unfinished
+    → 不 success
+    → 向 context 注入 reminder
+    → 继续下一轮
+```
+
+建议提示：
+
+```text
+You still have unfinished tasks.
+Review task_list and either complete them,
+re-plan them, or explicitly explain why they should be removed.
+```
+
+该机制不要求简单请求强制建 Task。
+
+---
+
+## 4.5 增加轻量 Planning Policy，而不是独立 Planner
+
+不要求每个请求都先创建 Task。
+
+对于明显多阶段 Coding Task：
+
+```text
+inspect
+→ modify
+→ test
+→ verify
+```
+
+System Prompt 增加规则：
+
+```text
+For multi-step coding tasks:
+1. inspect only enough context to understand the task;
+2. create a task plan before substantial edits;
+3. encode ordering with dependencies;
+4. keep task status up to date;
+5. re-plan when new information invalidates the original plan.
+```
+
+可选 Harness reminder：
+
+```text
+如果已执行 N 个 exploration step
+且尚未产生 write/tool side effect
+且尚未创建 Task
+→ 注入 planning reminder
+```
+
+第一阶段不做复杂任务分类器。
+
+---
+
+## 4.6 Step Budget 从“硬上限”升级为“可感知预算”
+
+保留 `max_steps` 作为最终安全阈值，但增加阶段提醒：
+
+```text
+70%：提醒剩余预算
+85%：要求停止可选探索，优先 unfinished tasks
+95%：禁止启动大范围新探索，优先验证/收尾
+100%：failed(exceeded_max_steps)
+```
+
+例如：
+
+```text
+Step budget: 85/100 used.
+Prioritize unfinished tasks and validation.
+Avoid optional exploration.
+```
+
+本 ADR 暂不实现真正自动续跑。
+
+---
+
+## 4.7 Session continuation 与 Task continuation 暂时分离
+
+S7 已经支持 multi-turn Session。
+
+本 ADR 不将 TaskManager 改成 session-global，因为：
+
+- 不同 run 可能代表不同用户请求；
+- session-global DAG 会引入旧任务污染问题；
+- 需要额外定义 task ownership / lifecycle。
+
+但是在 `exceeded_max_steps` 时，应在 RunOutcome / Session thread 中保存：
+
+```text
+unfinished task summary
+current task
+verification state
+```
+
+作为下一 run 的恢复提示。
+
+真正的 Task graph resume 作为后续 ADR 处理。
+
+---
+
+## 4.8 增加 Replanning 能力
+
+`task_update` 增加：
+
+```text
+subject
+description
+depends_on
+```
+
+允许执行中因新证据调整计划。
+
+例如：
+
+```text
+初始：
+#2 Extract build_parser()
+
+发现 private argparse API 不合理后：
+
+#2 Minimal CLI wiring without parser extraction
+```
+
+所有变更仍通过 events/trace 留痕。
+
+---
+
+## 4.9 completed 增加 completion evidence
+
+Task Model 增加可选字段：
+
+```python
+acceptance_criteria: list[str]
+completion_note: str
+verification: list[str]
+```
+
+示例：
 
 ```json
-{"type": "tool.call_started", "tool_name": "task_create",
- "params": {"subject": "Implement argparse --file + wire into cmd_run",
-            "description": "Add --file/--goal mutually exclusive args...",
-            "blocked_by": [1]}}
+{
+  "acceptance_criteria": [
+    "--goal and --file are mutually exclusive",
+    "missing file exits 1",
+    "unit tests pass"
+  ],
+  "completion_note": "CLI wiring implemented and targeted tests passed.",
+  "verification": [
+    "uv run pytest tests/unit/test_run_goal_file.py -q",
+    "uv run mypy src"
+  ]
+}
 ```
 
-`task_create` 工具返回（`tool.call_finished` 的 output 字段）也正确显示了 DAG：
-
-```json
-{"id": 2, ..., "blocked_by": [1], "status": "pending", ...}
-```
-
-**T1** — task 1 完成时（step 14，`task_update {task_id:1, status:"completed"}`）：
-
-```python
-# _clear_dependency(1) 扫描所有 task_*.json
-# 把 1 从 task_2.blocked_by 移除
-# → 磁盘上的 task_2.json: blocked_by = []
-```
-
-**T2** — run 结束后查看 `.tasks/task_2.json`：
-
-```json
-{"id": 2, "status": "completed", "blocked_by": []}  ← 依赖关系被抹平
-```
-
-### 问题
-**事后审计失败**。`events.jsonl` 保留了原始 DAG（`tool.call_started` params 里能看到 `"blocked_by": [1]`），但 `.tasks/*.json` 只保留了"全空依赖 + 全部 completed"的终态。看 JSON 文件的人无法回答"这次 run 中 task 3 究竟依赖谁"。
-
-### 决策
-**接受现状，不改代码**——理由：
-- Agent 运行时视角下 `_clear_dependency` 是有用的（简化了 LLM 维护反向引用）
-- 审计可以从 `events.jsonl` 重建（`tool.call_started` params 保留了完整的 DAG 定义）
-- 改成"软删除 / 历史快照"会引入新的 schema 复杂度，S3 阶段不值得
-
-**但记录设计约束**：`.tasks/*.json` 是**运行时快照**，不是**审计源**。审计必须从 `events.jsonl` 重建。
-
-### 影响后续
-S4+ 如果引入 sub-agent / 多 worker 并行执行，DAG 语义会从"顺序提示"变成"调度约束"。届时 `blocked_by` 的清空策略需要重新设计（可能要改成在 task 侧加 `unblocked_at` 时间戳而不是删除依赖）。
+第一阶段不引入独立 Evaluator Agent。
 
 ---
 
-## 问题 2: task 系统没有暴露 JSON-RPC handler，S3 集成测试 5 个失败
+## 4.10 Task 持久化改为原子写
 
-### 现状
-`src/leave_claude/core/app.py:153-155` 的 `CoreApp` 只注册了三个 handler：
-
-```python
-server.register("core.ping", self._ping_handler)
-server.register("agent.run", self._agent_run_handler)
-server.register("event.subscribe", self._subscribe_handler)
-```
-
-没有 `task.create` / `task.list` / `task.start` / `task.cancel` 的注册。
-
-`src/leave_claude/core/bus/commands.py` 也没有对应的 `TaskCreateCommand` / `TaskListCommand` 等 pydantic 模型（grep 确认：只有 `PingCommand` / `AgentRunCommand` / `EventSubscribeCommand`）。
-
-而 `tests/integration/test_s3_task_graph.py` 的 5 个测试**全部通过 wire 协议直接调 daemon**：
+当前：
 
 ```python
-resp = await _send_recv(reader, writer, "task.create", ...)
-# → {"error": {"code": -32601, "message": "Method not found: task.create", ...}}
+path.write_text(...)
 ```
 
-### 实际运行证据
-- `uv run pytest tests/integration -q` → **5 failed, 7 passed**
-- `git stash push -u` 回到改动前基线，**得到完全相同的 5 个失败**
-- 结论：这是 S3 commit 里的既存 gap，与 `--file` 功能无关
+改为：
 
-### 设计意图判断
-S3 commit message 明确说"**移除全部 CLI task 子命令，任务管理完全由 Agent 自主通过工具完成**"。测试里的 `task.create`/`task.start`/`task.cancel` 是模拟"外部客户端通过 daemon 通信"，但这个 wire 协议在 S3 设计里就不该存在（task 是 Agent 的私有空间，不是公共 API）。
+```text
+task_1.json.tmp
+    ↓ write / flush
+os.replace()
+    ↓
+task_1.json
+```
 
-### 决策
-**保留 5 个失败测试，不修 daemon**——理由：
-- S3 的哲学是"task 为 Agent 服务，不为人服务"
-- 修 daemon 意味着要在 `bus/commands.py` 加 4+ 个模型类，反而违背 S3 设计意图
-- 这 5 个测试可以标记为 `@pytest.mark.skip(reason="S3 spec gap: task.* wire protocol intentionally not implemented")` 或移到 `tests/pending/` 目录
+同时：
 
-**但记录两个未完成方向**：
-1. 若 S4+ 引入"跨 run 任务管理"（人可以用 CLI 查看/干预任务），此时才需要在 wire 层加 `task.*` 协议
-2. 若保留 `test_s3_task_graph.py` 作为 S4 规划参考，需要在测试文件顶部加 `pytest.skip` 标记，避免 CI 假阳性
+```text
+JSON parse error
+```
 
-### 影响后续
-- 目前 `pytest tests/integration` 结果是 **7 passed, 5 failed**，不是 clean green
-- CI/CD 若启用会红——需要在 CI 层面用 `pytest --deselect` 或 `xfail(strict=False)` 标记这 5 个
+不得在 `list_all()` 中静默忽略。
+
+至少：
+
+- log error；
+- 保留错误文件；
+- 返回可诊断信息。
 
 ---
 
-## 问题 3: 集成测试 fixture 污染真实 `runs/` 目录
+## 4.11 Task 成为一等事件对象
 
-### 现状
-`tests/conftest.py` 的 `running_daemon` fixture 起一个真实 daemon，但**没有把 daemon 的 runs_dir 指到 tmp**：
+增加：
 
-```python
-env = os.environ.copy()
-env["LEAVE_PORT"] = str(free_port)
-env["LEAVE_LOG_FILE"] = ""
-env["LEAVE_LOG_LEVEL"] = "WARNING"
-proc = subprocess.Popen([sys.executable, "-m", "leave_claude.core"], env=env)
+```text
+task.created
+task.updated
+task.started
+task.completed
+task.replanned
 ```
 
-测试里发出的 `agent.run`（`tests/integration/test_s2_dual_process.py:33,79,118`）用的是真实 runs_dir（默认 `./runs/`）：
+事件。
 
-```python
-result = await client.send_command("agent.run", {"goal": "hello"})
-await client1.send_command("agent.run", {"goal": "broadcast test"})
-await client1.send_command("agent.run", {"goal": "replay test"})
+TUI 不再只能从 `tool.call_*` 推断 Task 状态。
+
+后续可以展示：
+
+```text
+Tasks
+────────────────────────────────
+✓ #1 Design
+✓ #2 Implement
+▶ #3 Tests
+○ #4 Verify      depends on #3
 ```
 
-### 实际运行证据
-我前一天清了 `runs/` 目录，跑 3 轮集成测试又产生了 33 个测试 run（goal 是 `"hello"` / `"broadcast test"` / `"replay test"`），全部 `failed`，1-2 步就结束。
-
-### 问题
-- **真实 run 历史被测试垃圾污染**——想查一次真人 run 得在一堆 `hello` 里翻
-- 测试 run 还会**真调用 LLM**（`hello` 也要走 Anthropic API），浪费 token
-- `runs/` 目录没有被 `.gitignore` 屏蔽（实际被屏蔽了——commit 里看不到），但**依然占磁盘**，累积会越来越大
-
-### 决策
-**需要修**——最低成本方案是在 `running_daemon` fixture 里加一个环境变量：
-
-```python
-env["LEAVE_RUNS_DIR"] = str(tmp_path / "runs")  # ← S3 还没实现这个环境变量
-```
-
-对应需要在 `src/leave_claude/core/config.py` 加 `LEAVE_RUNS_DIR` env var 支持（如果 S3 没有）。若实现成本高，备选方案是**集成测试只调 `task.*` 类测试，不真调 `agent.run`**（但这会丢失对 run 链路的覆盖）。
-
-### 影响后续
-- S4+ 若加入"清理老 run"功能（如 `leave core cleanup --older-than 30d`），应该能识别"测试产生的 run"（可通过 goal 前缀 `hello` / `broadcast test` / `replay test` 识别，但这很 hacky）
-- 更干净的做法是 daemon 启动时读取 `LEAVE_RUNS_DIR`，测试 fixture 把它指到 tmp 目录
+Task Board 属于 P1，可在核心 TaskManager hardening 后实现。
 
 ---
 
-## 问题 4: `max_tokens=4096` 硬编码 + `stop_reason=max_tokens` 时直接 failed
+## 5. 暂不解决的问题
 
-### 现状
-`src/leave_claude/core/llm/provider.py:63`：
+本 ADR 明确不实现：
+
+### 5.1 完整 Task Scheduler
+
+暂不做：
+
+```text
+自动 next runnable
+DAG 拓扑调度
+任务优先级
+deadline
+自动并行执行
+```
+
+LLM 仍负责选择当前 task。
+
+### 5.2 Task 与 Subagent 自动绑定
+
+S7 已有：
+
+```text
+spawn_agent
+agent_result
+```
+
+但本 ADR 不设计：
+
+```text
+Task #5
+assigned_to=subagent-X
+```
+
+该能力应在真实出现“一个主 Agent 需要调度多个并行 Worker”的需求后单独设计。
+
+### 5.3 Parent / Child Task Tree
+
+先保留扁平 DAG。
+
+如果后续频繁出现：
+
+```text
+Verify
+├── investigate failure
+├── smoke test
+└── update docs
+```
+
+再引入：
 
 ```python
-"max_tokens": 4096,
+parent_id
 ```
-
-`src/leave_claude/core/loop.py:72-77`：
-
-```python
-# Termination check — end_turn wins over max_steps if both hit on same step
-if stop_reason == "end_turn":
-    context.mark_succeeded()
-elif context.step >= context.max_steps:
-    context.mark_failed("exceeded_max_steps")
-```
-
-没有对 `stop_reason == "max_tokens"` 的显式处理——**响应被截断时 tool_use JSON 不完整**，Anthropic SDK / provider 校验失败，异常往上冒，被 `loop.py` 捕获成 `llm_error`。
-
-### 实际运行证据
-`runs/20260925-140449-9751ad/`（15 步失败的 run）：
-
-```json
-{"type": "llm.usage", "output_tokens": 4096}      ← step 23 踩满
-{"type": "run.finished", "status": "failed", "reason": "llm_error", "steps": 15}
-```
-
-同一 run 里 step 21/22 的 `output_tokens = 3383 / 3364`（接近满）。
-
-后续（2026-09-25 下午）临时修法是**直接把 `max_tokens` 提到 16384**（工作区改动，未 commit 到 S3 commit 里），但没有做 `stop_reason == "max_tokens"` 的显式处理，只是把问题推迟到 16384 触发的时候。
-
-### 问题
-- **4096/16384 都只是推迟**，任务足够复杂时终会撞上限
-- DeepSeek 的 `finish_reason=length`（OpenAI 风格）→ Anthropic 的 `stop_reason=max_tokens` 映射可能在 provider 层丢掉
-- LLM 被截断时丢失的往往是最关键的 tool_use JSON——直接 failed 浪费了前面 N 步积累的工作
-
-### 决策
-**需要修，但分两层**：
-1. **Provider 层**：`max_tokens` 从硬编码改成 `LEAVE_LLM_MAX_TOKENS` 环境变量 / `llm.max_tokens` TOML 配置（跟随 `max_steps` 的四层优先级）
-2. **Loop 层**：`stop_reason == "max_tokens"` 时不直接 failed，而是：
-   - 丢弃截断的 tool_use block
-   - 向 LLM 注入一条 system 提示："上次回复因达到 max_tokens 被截断，请缩短输出或分步调用工具"
-   - 让 LLM 重试一次（最多 2 次，之后才 failed）
-
-### 影响后续
-- S4+ 引入 sub-agent / 更复杂的任务编排后，单步响应会更容易踩 4096/16384 上限
-- S6 引入 cost_budget router 后，`max_tokens` 也是预算控制的一部分，必须可配置
 
 ---
 
-## 总结：4 个问题的优先级
+## 6. 推荐实施顺序
 
-| 编号 | 问题 | 严重度 | 修法 | 时机 |
-|---|---|---|---|---|
-| 1 | `_clear_dependency` 抹平 DAG 审计 | 低 | 接受现状；审计走 events.jsonl | 不修 |
-| 2 | task 系统无 wire 协议 → 5 个集成测试失败 | 中 | skip 标记 / xfail；真修等到需要跨 run 任务管理时 | S4+ |
-| 3 | 集成测试污染真实 `runs/` | 中 | `LEAVE_RUNS_DIR` env var 指向 tmp | **S4 前必修** |
-| 4 | `max_tokens` 硬编码 + 截断即 failed | **高** | 环境变量 + max_tokens 重试逻辑 | **S4 前必修** |
+### Phase A — Task 数据模型修正（P0）
 
-**推荐实施顺序**（S4 开始前）：问题 4（最痛，直接影响 run 成功率）→ 问题 3（一次性修好永久解决）→ 问题 2（CI 层面先 skip，真修看需求）→ 问题 1（不修，接受现状）。
+修改：
+
+```text
+core/task/model.py
+core/task/manager.py
+core/tools/builtin/task_create.py
+core/tools/builtin/task_update.py
+tests/unit/test_task_model.py
+tests/unit/test_task_manager.py
+```
+
+完成：
+
+1. `blocked_by → depends_on`
+2. unresolved 动态计算
+3. transition guard
+4. dependency validation
+5. cycle detection
+6. atomic write
+
+### Phase B — AgentLoop Task-aware（P0）
+
+修改：
+
+```text
+core/runner.py
+core/loop.py
+core/context.py（若需要 reminder）
+tests/unit/test_loop.py
+tests/unit/test_runner.py
+```
+
+完成：
+
+1. AgentLoop 注入 TaskManager
+2. end_turn completion guard
+3. step budget reminders
+
+### Phase C — Replanning + Evidence（P1）
+
+修改：
+
+```text
+core/task/model.py
+core/task/manager.py
+task_update.py
+```
+
+增加：
+
+```text
+description update
+depends_on update
+acceptance criteria
+completion evidence
+```
+
+### Phase D — Task Events / TUI（P1）
+
+增加：
+
+```text
+task.created
+task.updated
+task.completed
+```
+
+以及 TUI Task Board。
 
 ---
 
-## 附：本次复盘使用的证据
+## 7. 最低验收标准
 
-- `runs/20260925-140449-9751ad/` — 15 步失败 run（暴露问题 4 的 max_tokens 截断）
-- `runs/20260925-144950-d85a79/` — 45 步成功 run（暴露问题 1 的 DAG 抹平 + 问题 3 的测试污染）
-- `runs/20260925-144950-d85a79/.tasks/task_1.json` 至 `task_4.json` — DAG 被抹平后的终态
-- `tests/conftest.py:running_daemon` — 未隔离 runs_dir 的 fixture
-- `tests/integration/test_s2_dual_process.py:33,79,118` — 产生 "hello"/"broadcast test"/"replay test" 的测试
-- `tests/integration/test_s3_task_graph.py` — 5 个 wire 协议测试
-- `src/leave_claude/core/task/manager.py:79-80,107-120` — `_clear_dependency` 实现
-- `src/leave_claude/core/llm/provider.py:63` — `max_tokens: 4096` 硬编码
-- `src/leave_claude/core/loop.py:72-77` — `stop_reason` 处理逻辑
+### 依赖历史
+
+```text
+Given:
+#2 depends_on=[1]
+
+When:
+#1 completed
+
+Then:
+#2.depends_on == [1]
+#2.unresolved_dependencies == []
+```
+
+### 状态约束
+
+```text
+blocked pending → in_progress
+=> rejected
+```
+
+```text
+pending → completed
+=> rejected
+```
+
+### 环检测
+
+```text
+#1 depends_on=[2]
+#2 depends_on=[1]
+=> rejected
+```
+
+### AgentLoop
+
+```text
+LLM end_turn
++
+unfinished tasks exist
+=> run does not success
+```
+
+```text
+LLM end_turn
++
+all tasks completed
+=> success
+```
+
+### 简单任务兼容
+
+```text
+LLM never creates Task
++
+end_turn
+=> success
+```
+
+### Budget
+
+在接近 `max_steps` 时可观察到明确 reminder，最终阈值仍保留 fail-safe。
+
+### 持久化
+
+进程在写临时文件时被中断，不得破坏已有 `task_N.json`。
+
+---
+
+## 8. 迁移策略
+
+为避免破坏已有 S3 `.tasks/*.json`：
+
+读取时兼容：
+
+```python
+depends_on = data.get("depends_on", data.get("blocked_by", []))
+```
+
+新写入只使用：
+
+```text
+depends_on
+```
+
+旧 `blocked_by` 在读取期视为历史依赖，不再执行 `_clear_dependency()`。
+
+建议保留一到两个版本兼容窗口后再删除 legacy parser。
+
+---
+
+## 9. 结果与权衡
+
+### 优点
+
+- 保留 S3 简洁架构；
+- Task DAG 可复盘；
+- Task 从“LLM 自律”升级为轻量状态机；
+- 避免 premature success；
+- 降低长任务在 max_steps 附近失控的概率；
+- 为未来 Task Board / Scheduler / Subagent orchestration 留出干净接口。
+
+### 成本
+
+- AgentLoop 与 TaskManager 产生轻度耦合；
+- TaskManager 测试复杂度增加；
+- 旧 `.tasks` 需要兼容迁移；
+- 更强状态约束可能暴露现有 LLM 调用中的非法状态转换，需要调整 Tool description / prompt。
+
+### 接受的权衡
+
+当前 LeaveClaude 的目标不是构造完整 workflow engine，而是构造一个稳定、透明、可恢复的 Coding Agent Harness。
+
+因此选择：
+
+```text
+Task Tools
+    +
+Lightweight Task State Machine
+    +
+Task-aware AgentLoop
+```
+
+而不是：
+
+```text
+Planner
+→ Scheduler
+→ Executor
+→ Evaluator
+→ Workflow Engine
+```
+
+---
+
+## 10. 后续 ADR 候选
+
+若后续出现真实需求，再分别设计：
+
+1. **Task DAG 跨 Run / Session Resume**
+2. **Task ↔ Subagent Assignment**
+3. **Parallel DAG Scheduler**
+4. **Hierarchical Parent/Child Task**
+5. **Task Verification / Evaluator Agent**
