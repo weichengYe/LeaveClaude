@@ -5,20 +5,20 @@ import json
 import logging
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 from rich.markdown import Markdown
 from textual import events
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widget import Widget
-from textual.binding import Binding
 from textual.widgets import Label, Static, TextArea
 
 from leave_claude.core.config import LeaveConfig
 from leave_claude.core.transport.socket_client import IpcError, SocketClient
+
+log = logging.getLogger(__name__)
 
 
 def _preview(s: str, n: int) -> str:
@@ -167,7 +167,7 @@ class PermissionSelect(Static):
     # 用户作出权限决策时发布，携带工具 ID 和决策字符串
     class Decided(Message):
         # 初始化决策消息，存储控件引用、工具 ID 和决策
-        def __init__(self, widget: "PermissionSelect", tool_use_id: str, decision: str) -> None:
+        def __init__(self, widget: PermissionSelect, tool_use_id: str, decision: str) -> None:
             self.widget = widget
             self.tool_use_id = tool_use_id
             self.decision = decision
@@ -200,7 +200,11 @@ class PermissionSelect(Static):
 
     # 焦点到达时记录，用于确认 focus() 是否真正生效
     def on_focus(self, event: events.Focus) -> None:
-        log.debug("PermissionSelect.on_focus  has_focus=%s  app.focused=%r", self.has_focus, self.app.focused)
+        log.debug(
+            "PermissionSelect.on_focus  has_focus=%s  app.focused=%r",
+            self.has_focus,
+            self.app.focused,
+        )
 
     # 焦点离开时记录，用于追踪是否被其他控件抢走焦点
     def on_blur(self, event: events.Blur) -> None:
@@ -376,6 +380,7 @@ class LeaveTuiApp(App[None]):
         self._pending_permission_blocks: dict[str, PermissionBlock] = {}
         self._session_id: str | None = None
         self._busy = False
+        self._last_context_pct: float = 0.0
 
     def compose(self) -> ComposeResult:
         yield Label("[bold]LeaveClaude[/bold]  [dim]connecting...[/dim]", id="header")
@@ -430,6 +435,12 @@ class LeaveTuiApp(App[None]):
         content = event.value.strip()
         if not content:
             return
+        # 检测 /compact 指令
+        if content == "/compact":
+            event.text_area.text = ""
+            if self._client is not None and self._session_id is not None and not self._busy:
+                self.run_worker(self._do_compact(), name="compact", exclusive=False)
+            return
         if self._client is None or self._session_id is None or self._busy:
             self._append(Static("[yellow]agent busy or disconnected[/yellow]", classes="log-line"))
             return
@@ -442,6 +453,27 @@ class LeaveTuiApp(App[None]):
         self._append(Static(f"[bold]>[/bold] {content}", classes="user-turn"))
         self._update_header("running")
         self.run_worker(self._do_send_message(content), name="send_message", exclusive=False)
+
+    # 在 worker 中执行手动压缩命令，完成后显示结果横幅
+    async def _do_compact(self) -> None:
+        if self._client is None or self._session_id is None:
+            return
+        self._append(Static("[dim]⚡ compacting context...[/dim]", classes="log-line"))
+        try:
+            result = await self._client.send_command(
+                "session.compact",
+                {"session_id": self._session_id, "focus": ""},
+            )
+            summary_tokens = result.get("summary_tokens", 0)
+            saved_tokens = result.get("saved_tokens", 0)
+            self._last_context_pct = 0.0
+            self._append(Static(
+                f"[bold cyan]⚡ Context compacted[/bold cyan]"
+                f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens[/dim]",
+                classes="log-line",
+            ))
+        except (IpcError, RuntimeError, OSError) as e:
+            self._append(Static(f"[red]compact error: {e}[/red]", classes="log-line"))
 
     # 在 worker 中执行 IPC 发送，使 App 消息泵在 agent 运行期间仍能处理键盘/焦点等消息
     async def _do_send_message(self, content: str) -> None:
@@ -513,6 +545,19 @@ class LeaveTuiApp(App[None]):
         except Exception:
             return None
 
+    # 生成 context 占用率的彩色进度条字符串
+    def _render_ctx_bar(self, pct: float) -> str:
+        filled = int(pct * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        label = f"ctx:{pct * 100:.1f}%"
+        if pct >= 0.85:
+            color = "bold red"
+        elif pct >= 0.70:
+            color = "yellow"
+        else:
+            color = "dim"
+        return f"[{color}]{label} {bar}[/{color}]"
+
     # 根据连接和运行状态刷新顶部标题
     def _update_header(self, state: str) -> None:
         try:
@@ -572,6 +617,7 @@ class LeaveTuiApp(App[None]):
                         "llm.usage",
                         "log.*",
                         "permission.*",
+                        "context.*",
                     ],
                     "scope": "global",
                 }
@@ -704,12 +750,26 @@ class LeaveTuiApp(App[None]):
                 ))
 
         elif t == "llm.usage":
+            pct = float(event.get("context_pct") or 0.0)
+            self._last_context_pct = pct
+            ctx_bar = self._render_ctx_bar(pct)
             self._append(Static(
                 f"[dim]  tokens  "
                 f"in={event.get('input_tokens')} "
                 f"out={event.get('output_tokens')} "
-                f"cache={event.get('cache_read_input_tokens')}[/dim]",
+                f"cache={event.get('cache_read_input_tokens')}[/dim]"
+                f"  {ctx_bar}",
                 classes="usage",
+            ))
+
+        elif t == "context.compacted":
+            orig = event.get("original_tokens", 0)
+            summary = event.get("summary_tokens", 0)
+            self._last_context_pct = 0.0
+            self._append(Static(
+                f"[bold cyan]⚡ Context compacted[/bold cyan]"
+                f"  [dim]original≈{orig} tokens → summary={summary} tokens[/dim]",
+                classes="log-line",
             ))
 
         elif t == "permission.requested":
@@ -733,16 +793,19 @@ class LeaveTuiApp(App[None]):
             self._append(perm_block)
             select = PermissionSelect(tool_use_id)
             self._mount_permission_select(select)
-            log.debug("PermissionSelect mounted before #prompt  pending=%d", len(self._pending_permission_blocks))
+            log.debug(
+                "PermissionSelect mounted before #prompt  pending=%d",
+                len(self._pending_permission_blocks),
+            )
 
         elif t == "permission.denied":
-            # 处理超时或断连等非用户交互触发的 deny（用户主动 deny 已由 on_permission_select_decided 处理）
+            # 处理超时或断连等非用户交互触发的 deny
+            # （用户主动 deny 已由 on_permission_select_decided 处理）
             tool_use_id = str(event.get("tool_use_id", ""))
             decision = str(event.get("decision", "denied"))
             if tool_use_id in self._pending_permission_blocks:
-                perm_block = self._pending_permission_blocks.pop(tool_use_id, None)
-                if perm_block is not None:
-                    perm_block._resolve(decision)
+                perm_block = self._pending_permission_blocks.pop(tool_use_id)
+                perm_block._resolve(decision)
                 try:
                     select = self.query_one(PermissionSelect)
                     select.remove()

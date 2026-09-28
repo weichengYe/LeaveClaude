@@ -23,7 +23,13 @@ def main() -> None:
     subparsers.add_parser("chat", help="Start a multi-turn chat session")
 
     run_parser = subparsers.add_parser("run", help="Run an agent task")
-    run_parser.add_argument("--goal", required=True, help="Goal for the agent to accomplish")
+    # --goal 与 --file 互斥且必须二选一：直接给出目标，或从文本文件读取目标
+    goal_source = run_parser.add_mutually_exclusive_group(required=True)
+    goal_source.add_argument("--goal", help="Goal for the agent to accomplish")
+    goal_source.add_argument(
+        "--file",
+        help="Read the goal from a UTF-8 text file",
+    )
 
     core_parser = subparsers.add_parser("core", help="Manage the core daemon")
     core_sub = core_parser.add_subparsers(dest="core_command")
@@ -52,7 +58,7 @@ def main() -> None:
     elif args.command == "chat":
         cmd_chat(config)
     elif args.command == "run":
-        cmd_run(args.goal, config)
+        cmd_run(args.goal, config, file=args.file)
     elif args.command == "core":
         if args.core_command == "start":
             cmd_core_start(config)
