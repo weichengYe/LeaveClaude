@@ -18,3 +18,16 @@
 | [0007](0007-s5-permission-tool-execution-review.md) | S5 Permission / Tool Execution / Human-in-the-loop 安全边界审查 | Proposed / Deferred | 2026-09-27 |
 | [0008](0008-s6-context-engineering-review.md) | S6 上下文工程 / 压缩 / LLM 可靠性架构审查 | Proposed / Deferred | 2026-10-02 |
 | [0009](0009-s7-extensible-agent-runtime-review.md) | S7 可扩展 Agent Runtime 架构审查(Skill / Agent Profile / Subagent / MCP) | Proposed / Deferred | 2026-10-02 |
+
+## v0.1 独立改造
+
+ADR 0003–0009 是对 KamaClaude S0–S7 各阶段的架构审查，多数处于 Deferred 状态。以下是从
+LeaveClaude 自身出发、已落地实现的独立改造：
+
+| 文档 | 标题 | 状态 | 日期 |
+|---|---|---|---|
+| [Task Completion Guard](LeaveClaude_v0.1_Task_Completion_Guard.md) | v0.1 独立改造：任务完成性守卫——end_turn 不再等价于成功 | 已实现 | 2026-10-02 |
+
+## 相关文档
+
+- [../note/](../note/) — S0–S7 各阶段的学习笔记，是上述 ADR 的原始推导过程
