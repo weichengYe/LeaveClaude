@@ -38,6 +38,7 @@ from leave_claude.core.config import LeaveConfig, get_config
 from leave_claude.core.events.bus import EventBus
 from leave_claude.core.llm.provider import AnthropicProvider
 from leave_claude.core.logging_setup import setup_logging
+from leave_claude.core.mcp.server import McpServerManager
 from leave_claude.core.permissions.manager import PermissionManager
 from leave_claude.core.permissions.storage import load_policy_file
 from leave_claude.core.runner import AgentRunner
@@ -65,6 +66,7 @@ class CoreApp:
         self._running_runs: set[asyncio.Task[Any]] = set()
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
+        self._mcp_manager: McpServerManager | None = None
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -130,8 +132,7 @@ class CoreApp:
         cmd = PermissionRespondCommand.model_validate(params)
         logger.info(
             "permission.respond received tool_use_id=%s decision=%s",
-            cmd.tool_use_id,
-            cmd.decision,
+            cmd.tool_use_id, cmd.decision,
         )
         if self._permission_manager is None:
             logger.error("permission.respond: PermissionManager not initialized")
@@ -233,6 +234,12 @@ class CoreApp:
         store = SessionStore(sessions_root)
         assert self._config is not None
         compact_provider = AnthropicProvider(self._config.llm.default_model)
+
+        self._mcp_manager = McpServerManager()
+        if self._config.mcp.servers:
+            logger.info("mcp: starting %d server(s)", len(self._config.mcp.servers))
+            await self._mcp_manager.start_all(self._config.mcp.servers)
+
         self._sessions = SessionManager(
             store,
             runner_factory=lambda: AgentRunner(
@@ -240,6 +247,7 @@ class CoreApp:
                 bus=self._bus,
                 trace=self._trace,
                 permission_manager=self._permission_manager,
+                mcp_manager=self._mcp_manager,
             ),
             bus=self._bus,
             provider=compact_provider,
@@ -277,6 +285,8 @@ class CoreApp:
             run_task.cancel()
         if self._running_runs:
             await asyncio.gather(*self._running_runs, return_exceptions=True)
+        if self._mcp_manager is not None:
+            await self._mcp_manager.stop_all()
         await server.stop()
         if self._trace is not None:
             await self._trace.stop()

@@ -16,3 +16,5 @@
 | [0005](0005-s3-review.md) | S3 Task Planning 系统强化——保留任务 DAG、收紧状态约束并让 AgentLoop 感知任务状态 | Proposed | 2026-09-26 |
 | [0006](0006-s4-session-state-memory-context-review.md) | S4 Session 引入后的 State / Memory / Context 边界审查 | Proposed / Deferred | 2026-09-27 |
 | [0007](0007-s5-permission-tool-execution-review.md) | S5 Permission / Tool Execution / Human-in-the-loop 安全边界审查 | Proposed / Deferred | 2026-09-27 |
+| [0008](0008-s6-context-engineering-review.md) | S6 上下文工程 / 压缩 / LLM 可靠性架构审查 | Proposed / Deferred | 2026-10-02 |
+| [0009](0009-s7-extensible-agent-runtime-review.md) | S7 可扩展 Agent Runtime 架构审查(Skill / Agent Profile / Subagent / MCP) | Proposed / Deferred | 2026-10-02 |

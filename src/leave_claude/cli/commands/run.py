@@ -4,38 +4,10 @@ import asyncio
 import json
 import sys
 import time
-from pathlib import Path
 from typing import Any
 
 from leave_claude.core.config import LeaveConfig
 from leave_claude.core.transport.socket_client import IpcError, SocketClient
-
-
-# 读取 goal 文件失败时抛出，携带面向用户的错误信息
-class GoalFileError(Exception):
-    pass
-
-
-# 从文本文件读取 goal 内容并去除首尾空白，失败时抛出 GoalFileError
-def read_goal_from_file(path: str) -> str:
-    file_path = Path(path).expanduser()
-    try:
-        content = file_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        raise GoalFileError(f"goal file not found: {path}") from None
-    except IsADirectoryError:
-        raise GoalFileError(f"goal file is a directory: {path}") from None
-    except PermissionError:
-        raise GoalFileError(f"goal file is not readable: {path}") from None
-    except UnicodeDecodeError:
-        raise GoalFileError(f"goal file is not valid UTF-8 text: {path}") from None
-    except OSError as e:
-        raise GoalFileError(f"cannot read goal file ({path}): {e}") from None
-
-    goal = content.strip()
-    if not goal:
-        raise GoalFileError(f"goal file is empty: {path}")
-    return goal
 
 
 class StdoutPrinter:
@@ -141,19 +113,8 @@ async def _run_async(goal: str, config: LeaveConfig) -> int:
     return exit_code
 
 
-# 执行 leave run 命令：从 --goal 或 --file 解析目标后发起一次 agent run
-def cmd_run(goal: str | None, config: LeaveConfig, *, file: str | None = None) -> None:
-    if file is not None:
-        try:
-            goal = read_goal_from_file(file)
-        except GoalFileError as e:
-            print(f"error: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    if goal is None or not goal.strip():
-        print("error: goal must not be empty", file=sys.stderr)
-        sys.exit(1)
-
+# 执行 leave run --goal "..." 命令
+def cmd_run(goal: str, config: LeaveConfig) -> None:
     try:
         exit_code = asyncio.run(_run_async(goal, config))
     except KeyboardInterrupt:

@@ -24,8 +24,7 @@ def _now() -> str:
 
 
 class AgentLoop:
-    # 初始化循环所需依赖：LLM provider、工具注册表、事件总线，以及可选的权限管理器、
-    # 压缩器和 session ID
+    # 初始化循环依赖：provider、工具表、事件总线及可选的权限、压缩和 session 状态
     def __init__(
         self,
         provider: LLMProvider,
@@ -79,7 +78,8 @@ class AgentLoop:
                 break
 
             # [observe] append assistant content blocks to context
-            blocks: list[dict[str, object]] = []
+            # thinking blocks must come first and be preserved verbatim for extended thinking mode
+            blocks: list[dict[str, object]] = list(response.thinking_blocks)
             if response.text:
                 blocks.append({"type": "text", "text": response.text})
             for tc in response.tool_calls:
@@ -103,8 +103,7 @@ class AgentLoop:
                 for tc in response.tool_calls:
                     context.add_tool_result(
                         tc.id,
-                        "Error: output token limit reached before this tool call "
-                        "could be completed. "
+                        "Error: output token limit reached before this tool call was completed. "
                         "Please break the task into smaller steps and try again.",
                         is_error=True,
                     )
