@@ -15,6 +15,7 @@ from leave_claude.core.tools.registry import ToolRegistry
 if TYPE_CHECKING:
     from leave_claude.core.compact.compactor import Compactor
     from leave_claude.core.permissions.manager import PermissionManager
+    from leave_claude.core.task.manager import TaskManager
 
 
 log = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ def _now() -> str:
 
 
 class AgentLoop:
-    # 初始化循环依赖：provider、工具表、事件总线及可选的权限、压缩和 session 状态
+    # 初始化循环依赖：provider、工具表、事件总线及可选的权限、压缩、任务和 session 状态
     def __init__(
         self,
         provider: LLMProvider,
@@ -35,6 +36,8 @@ class AgentLoop:
         compactor: Compactor | None = None,
         compact_threshold: float = 0.80,
         session_id: str = "",
+        task_manager: TaskManager | None = None,
+        max_completion_guard_retries: int = 2,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -43,9 +46,13 @@ class AgentLoop:
         self._compactor = compactor
         self._compact_threshold = compact_threshold
         self._session_id = session_id
+        self._task_manager = task_manager
+        self._max_completion_guard_retries = max_completion_guard_retries
 
     # 驱动 plan→act→observe 循环直到上下文终止；CancelledError 向上传播
     async def run(self, context: ExecutionContext) -> None:
+        # 连续提前收尾的次数；有真实工具调用推进时归零
+        guard_retries = 0
         while not context.is_done():
             context.step += 1
             await self._bus.publish(
@@ -108,11 +115,33 @@ class AgentLoop:
                         is_error=True,
                     )
 
+            # 工具调用代表实际推进，重置连续提前收尾计数
+            if response.stop_reason == "tool_use":
+                guard_retries = 0
+
             # Termination check — end_turn wins over max_steps if both hit on same step
             if response.stop_reason == "end_turn":
-                context.result = response.text or ""
-                context.mark_success()
+                if self._can_finish():
+                    context.result = response.text or ""
+                    context.mark_success()
+                elif guard_retries < self._max_completion_guard_retries:
+                    # 计划任务未完成：注入结构化提醒并继续循环，不把 end_turn 当成功
+                    guard_retries += 1
+                    log.warning(
+                        "completion guard: unfinished tasks, retry %d/%d run_id=%s step=%d",
+                        guard_retries,
+                        self._max_completion_guard_retries,
+                        context.run_id,
+                        context.step,
+                    )
+                    context.add_user_message(self._build_unfinished_reminder())
+                else:
+                    # 有限纠偏耗尽：明确失败，并附带未完成任务诊断
+                    context.result = response.text or ""
+                    self._record_unfinished_tasks(context)
+                    context.mark_failed("unfinished_tasks")
             elif context.step >= context.max_steps:
+                self._record_unfinished_tasks(context)
                 context.mark_failed("exceeded_max_steps")
 
             # 工具结果追加完毕（messages 末尾为 user）后检查压缩，仅在 run 继续时触发
@@ -130,3 +159,35 @@ class AgentLoop:
             await self._bus.publish(
                 StepFinishedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )
+
+    # 判断本 run 是否满足 Harness 级成功条件：未创建任务，或已创建且全部完成
+    def _can_finish(self) -> bool:
+        if self._task_manager is None:
+            return True
+        if not self._task_manager.has_tasks():
+            return True
+        return self._task_manager.all_completed()
+
+    # 构造结构化未完成任务提醒，促使模型继续执行或显式调整计划
+    def _build_unfinished_reminder(self) -> str:
+        tasks = self._task_manager.unfinished_tasks() if self._task_manager else []
+        listing = "\n".join(f"- #{t.id} {t.subject} [{t.status}]" for t in tasks)
+        return (
+            "You attempted to finish the run, but planned tasks are still unfinished.\n\n"
+            f"Unfinished tasks:\n{listing}\n\n"
+            "Before finishing:\n"
+            "1. inspect the remaining tasks;\n"
+            "2. continue execution or update the plan if it is no longer valid;\n"
+            "3. only finish after all required tasks are completed or explicitly explain "
+            "why the plan must change.\n\n"
+            "Use task_list if you need the latest task state."
+        )
+
+    # 将未完成任务摘要写入 context，供 RunOutcome 与 run.finished 事件向上层传递诊断
+    def _record_unfinished_tasks(self, context: ExecutionContext) -> None:
+        if self._task_manager is None:
+            return
+        context.unfinished_tasks = [
+            {"id": t.id, "subject": t.subject, "status": t.status}
+            for t in self._task_manager.unfinished_tasks()
+        ]

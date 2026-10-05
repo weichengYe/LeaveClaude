@@ -22,8 +22,10 @@ class RunFinishedEvent(BaseModel):
     type: Literal["run.finished"] = "run.finished"
     run_id: str
     status: str  # "success" | "failed"
-    reason: str | None = None  # "exceeded_max_steps" | "cancelled" | "llm_error" | ...
+    # "exceeded_max_steps" | "unfinished_tasks" | "cancelled" | "llm_error" | ...
+    reason: str | None = None
     steps: int
+    unfinished_tasks: list[dict[str, Any]] = []  # Completion Guard 诊断：未完成任务摘要
     ts: str
 
 

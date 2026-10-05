@@ -127,3 +127,41 @@ def test_manager_resumes_id_from_existing_files(tmp_path: Path) -> None:
     mgr2 = TaskManager(tmp_path)
     task = mgr2.create("third")
     assert task.id == 3
+
+
+# 功能：验证 has_tasks 在无任务时返回 False、有任务时返回 True
+# 设计：同一 manager 先后断言两个状态，覆盖 Completion Guard 区分"从未创建任务"的判定依据
+def test_has_tasks_reflects_creation(tmp_path: Path) -> None:
+    mgr = TaskManager(tmp_path)
+    assert mgr.has_tasks() is False
+    mgr.create("work")
+    assert mgr.has_tasks() is True
+
+
+# 功能：验证 unfinished_tasks 只返回非 completed 的任务，且保持 ID 升序
+# 设计：构造 completed / pending / in_progress 三种状态，断言返回集合与顺序，覆盖 Guard 生成诊断列表的输入
+def test_unfinished_tasks_filters_completed(tmp_path: Path) -> None:
+    mgr = TaskManager(tmp_path)
+    mgr.create("done")
+    mgr.create("todo")
+    mgr.create("doing")
+    mgr.update(1, status="completed")
+    mgr.update(3, status="in_progress")
+    unfinished = mgr.unfinished_tasks()
+    assert [t.id for t in unfinished] == [2, 3]
+    assert [t.status for t in unfinished] == ["pending", "in_progress"]
+
+
+# 功能：验证 all_completed 在无任务时为 False，全部完成时才为 True
+# 设计：分三阶段断言（空 / 部分完成 / 全部完成），锁定"无任务不算 all_completed"这一由 AgentLoop 单独判断的语义边界
+def test_all_completed_requires_existing_and_finished_tasks(tmp_path: Path) -> None:
+    mgr = TaskManager(tmp_path)
+    assert mgr.all_completed() is False
+
+    mgr.create("first")
+    mgr.create("second")
+    mgr.update(1, status="completed")
+    assert mgr.all_completed() is False
+
+    mgr.update(2, status="completed")
+    assert mgr.all_completed() is True

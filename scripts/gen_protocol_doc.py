@@ -200,7 +200,8 @@ def generate() -> str:
         "\n",
         _model_section("RunFinishedEvent", RunFinishedEvent, {
             "type": "run.finished", "run_id": run_id,
-            "status": "success", "reason": None, "steps": 2, "ts": ts}),
+            "status": "success", "reason": None, "steps": 2,
+            "unfinished_tasks": [], "ts": ts}),
         "\n",
         _model_section("StepStartedEvent", StepStartedEvent,
             {"type": "step.started", "run_id": run_id, "step": 1, "ts": ts}),

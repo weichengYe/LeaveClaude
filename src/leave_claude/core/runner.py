@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from leave_claude.core.bus.events import RunFinishedEvent, RunStartedEvent
 from leave_claude.core.compact.compactor import Compactor
@@ -49,6 +50,8 @@ class RunOutcome:
     status: str
     result: str
     reason: str | None
+    # 失败或提前收尾时留下的未完成任务摘要；无任务或全部完成时为空
+    unfinished_tasks: list[dict[str, Any]] = field(default_factory=list)
 
 
 class AgentRunner:
@@ -226,6 +229,7 @@ class AgentRunner:
                     compactor=compactor,
                     compact_threshold=self._config.compaction.auto_threshold,
                     session_id=session_id_str,
+                    task_manager=task_manager,
                 )
                 await loop.run(context)
             except asyncio.CancelledError:
@@ -245,6 +249,7 @@ class AgentRunner:
                     status=context.status,
                     reason=context.reason,
                     steps=context.step,
+                    unfinished_tasks=context.unfinished_tasks,
                     ts=_now(),
                 )
             )
@@ -259,4 +264,5 @@ class AgentRunner:
             status=context.status,
             result=context.result,
             reason=context.reason,
+            unfinished_tasks=context.unfinished_tasks,
         )

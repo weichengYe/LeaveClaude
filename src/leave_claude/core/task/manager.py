@@ -101,6 +101,19 @@ class TaskManager:
                 pass
         return tasks
 
+    # 返回是否存在任何已创建的任务
+    def has_tasks(self) -> bool:
+        return bool(self.list_all())
+
+    # 返回所有未完成的任务（状态不是 completed），按 ID 升序
+    def unfinished_tasks(self) -> list[Task]:
+        return [t for t in self.list_all() if t.status != "completed"]
+
+    # 返回 True 表示已创建任务且全部完成；无任务时返回 False
+    def all_completed(self) -> bool:
+        tasks = self.list_all()
+        return bool(tasks) and all(t.status == "completed" for t in tasks)
+
     # 将 completed_id 从所有其他任务的 blocked_by 列表中移除
     def _clear_dependency(self, completed_id: int) -> None:
         for f in self._dir.glob("task_*.json"):

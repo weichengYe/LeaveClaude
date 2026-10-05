@@ -733,6 +733,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | `status` | `string` | yes |
 | `reason` | `string | null` | no |
 | `steps` | `integer` | yes |
+| `unfinished_tasks` | `array` | no |
 | `ts` | `string` | yes |
 
 ```json
@@ -768,6 +769,15 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
       "title": "Steps",
       "type": "integer"
     },
+    "unfinished_tasks": {
+      "default": [],
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Unfinished Tasks",
+      "type": "array"
+    },
     "ts": {
       "title": "Ts",
       "type": "string"
@@ -793,6 +803,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
   "status": "success",
   "reason": null,
   "steps": 2,
+  "unfinished_tasks": [],
   "ts": "2026-05-16T10:00:00.001Z"
 }
 ```

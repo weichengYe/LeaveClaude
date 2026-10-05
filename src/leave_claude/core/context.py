@@ -20,6 +20,8 @@ class ExecutionContext:
     result: str = ""
     # skill 或 subagent 角色可覆盖默认 system prompt
     system_prompt_override: str | None = None
+    # 运行结束时由 Completion Guard 写入的未完成任务摘要（诊断用）
+    unfinished_tasks: list[dict[str, Any]] = field(default_factory=list)
 
     # 初始化消息历史，优先使用 session 完整回放内容
     def __post_init__(self) -> None:
@@ -70,6 +72,10 @@ class ExecutionContext:
             last["content"].append(block)
         else:
             self.messages.append({"role": "user", "content": [block]})
+
+    # 追加一条用户角色文本消息（Harness 注入的纠偏提醒走这条路径）
+    def add_user_message(self, text: str) -> None:
+        self.messages.append({"role": "user", "content": text})
 
     # 返回 True 表示 loop 应停止（状态不再是 running）
     def is_done(self) -> bool:
