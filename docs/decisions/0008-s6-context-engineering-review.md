@@ -1,5 +1,7 @@
 # ADR 0008：S6 Context Engineering / Compaction / LLM Reliability 架构审查
 
+> 阶段复盘：[S6](../note/s6.md)
+
 - **Status**: Proposed / Deferred
 - **Stage**: KamaClaude S6
 - **Scope**: Context Engineering、Compaction、Session Persistence、LLM Reliability、Test Architecture

@@ -1,5 +1,7 @@
 # ADR 0005：S3 Task Planning 系统强化——保留任务 DAG、收紧状态约束并让 AgentLoop 感知任务状态
 
+> 阶段复盘：[S3](../note/s3.md)
+
 - **Status**: Proposed
 - **Date**: 2026-09-26
 - **Scope**: LeaveClaude / KamaClaude S3 Task Planning，兼容后续 S4–S7 架构

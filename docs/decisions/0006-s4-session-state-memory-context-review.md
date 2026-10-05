@@ -1,5 +1,7 @@
 # ADR 0006 — S4 Session 引入后的 State / Memory / Context 边界审查
 
+> 阶段复盘：[S4](../note/s4.md)
+
 - **Status**: Proposed / Deferred
 - **Stage**: KamaClaude `stage/s4`
 - **Scope**: Session、SessionStore、ExecutionContext、AgentRunner、TaskManager、NoteSaveTool

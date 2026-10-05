@@ -1,5 +1,7 @@
 # ADR-0009: S7 Extensible Agent Runtime Review
 
+> 阶段复盘：[S7](../note/s7.md)
+
 - **Status**: Proposed / Deferred
 - **Stage**: S7
 - **Scope**: Skill / Agent Profile / Subagent / Multi-Agent Orchestration / MCP / Runtime Governance

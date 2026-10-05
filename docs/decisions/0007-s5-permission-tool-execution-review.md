@@ -1,5 +1,7 @@
 # ADR 0007 — S5 Permission / Tool Execution / Human-in-the-loop 安全边界审查
 
+> 阶段复盘：[S5](../note/s5.md)
+
 - **Status**: Proposed / Deferred
 - **Stage**: KamaClaude `stage/s5`
 - **Scope**: PermissionPolicy、PermissionManager、Tool Invocation、Bash/File Tools、IPC、CLI/TUI、Permission Persistence、Retry、Tracing
